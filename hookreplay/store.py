@@ -217,8 +217,11 @@ def _publish(directory: Path, payload: bytes, prefix: str, generator: Callable[[
         if temporary is not None:
             try:
                 temporary.unlink(missing_ok=True)
-            except OSError as exc:
-                raise StorageError("storage_error", type(exc).__name__) from None
+            except OSError:
+                # A leftover temporary file never outranks the outcome: a
+                # published record stays published, and a pending error keeps
+                # its own reason. Readers ignore .tmp files.
+                pass
 
 
 def write_record(

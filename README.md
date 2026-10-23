@@ -63,7 +63,16 @@ POST 202 example-delivery-001 ping 42 null
 Fields are separated by single spaces. An invalid method, delivery ID or event
 is replaced with `-`. `bytes` is Content-Length after complete body reception,
 otherwise `-`; `verified` is `null` on acceptance and `-` on rejection. Logs do
-not contain request bodies or signature headers.
+not contain request bodies or signature headers, and a client disconnect is
+never reported as a traceback.
+
+Every rejection is a JSON object `{"reason": ...}`. A request the HTTP parser
+cannot read at all (malformed request line, unsupported HTTP version, oversized
+headers) is answered with `{"reason": "bad_request"}` and the parser's status
+code; the request is never echoed back. A storage failure is answered with
+HTTP 500, `reason` `storage_collision` or `storage_error`, and for the latter
+an `error_class` field naming the exception class only (never a path). The
+`Server` response header is `hookreplay`.
 
 ### replay
 

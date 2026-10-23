@@ -43,6 +43,13 @@ class Recorder(ThreadingHTTPServer):
         connection.settimeout(min(self.read_timeout, TIMEOUT_MAX))
         return connection, address
 
+    def handle_error(self, request, client_address):
+        # A reset or broken pipe during the header phase is the client's
+        # business: no traceback on stderr. Anything else is a defect and
+        # keeps the default report.
+        if not isinstance(sys.exc_info()[1], OSError):
+            super().handle_error(request, client_address)
+
 
 class Handler(BaseHTTPRequestHandler):
     def __getattr__(self, name):
@@ -55,15 +62,32 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-    def _respond(self, status: int, payload: dict, *, complete=False):
-        delivery = self.headers.get("X-GitHub-Delivery", "")
-        event = self.headers.get("X-GitHub-Event", "")
-        method = self.command if re.fullmatch(r"[A-Z]{1,16}", self.command) else "-"
+    def version_string(self):
+        # No interpreter or library version in the Server header.
+        return "hookreplay"
+
+    def send_error(self, code, message=None, explain=None):
+        # The stdlib parser calls this for a malformed request line, an
+        # unsupported HTTP version or oversized headers. Keep the JSON
+        # contract and the one-line log; never echo the request back.
+        self._respond(int(code), {"reason": "bad_request"})
+
+    def _log(self, status: int, *, complete=False):
+        command = getattr(self, "command", None) or ""
+        headers = getattr(self, "headers", None)
+        delivery = headers.get("X-GitHub-Delivery", "") if headers is not None else ""
+        event = headers.get("X-GitHub-Event", "") if headers is not None else ""
+        method = command if re.fullmatch(r"[A-Z]{1,16}", command) else "-"
         delivery = delivery if store.DELIVERY_RE.fullmatch(delivery) else "-"
         event = event if store.EVENT_RE.fullmatch(event) else "-"
         size = str(self.body_size) if complete else "-"
         verified = "null" if status == 202 else "-"
-        print(f"{method} {status} {delivery} {event} {size} {verified}", file=sys.stderr, flush=True)
+        # One write call per line: handler threads never interleave fields.
+        sys.stderr.write(f"{method} {status} {delivery} {event} {size} {verified}\n")
+        sys.stderr.flush()
+
+    def _respond(self, status: int, payload: dict, *, complete=False):
+        self._log(status, complete=complete)
         encoded = json.dumps(payload, separators=(",", ":")).encode("ascii")
         self.close_connection = True
         try:
@@ -134,9 +158,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             record = store.write_record(self.server.directory, bytes(body), headers)
         except store.StorageError as exc:
-            return self._reject(500, exc.reason, complete=True)
-        except (OSError, store.RecordError):
-            return self._reject(500, "storage_error", complete=True)
+            payload = {"reason": exc.reason}
+            if exc.error_class:
+                payload["error_class"] = exc.error_class
+            return self._respond(500, payload, complete=True)
+        except (OSError, store.RecordError) as exc:
+            # The exception class only: never a path, errno text or payload.
+            return self._respond(500, {"reason": "storage_error", "error_class": type(exc).__name__}, complete=True)
         self._respond(202, {"file": record.name, "verified": None}, complete=True)
 
 

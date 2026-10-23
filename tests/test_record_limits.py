@@ -1,3 +1,4 @@
+import errno
 from http.client import HTTPResponse
 import json
 import socket
@@ -65,7 +66,10 @@ def test_storage_failure_response(recorder, tmp_path, monkeypatch, reason):
     def fail(*args, **kwargs):
         raise store.StorageError(reason, "PermissionError" if reason == "storage_error" else "")
     monkeypatch.setattr(store, "write_record", fail)
-    assert exchange(recorder(), request_bytes(), b"{}") == (500, {"reason": reason})
+    expected = {"reason": reason}
+    if reason == "storage_error":
+        expected["error_class"] = "PermissionError"
+    assert exchange(recorder(), request_bytes(), b"{}") == (500, expected)
     assert list(tmp_path.iterdir()) == []
 
 
@@ -161,3 +165,93 @@ def test_record_directory_errors_precede_socket(tmp_path, monkeypatch, capsys, k
     monkeypatch.setattr(socket, "socket", forbidden)
     assert cli.main(["record", "--dir", str(target)]) == 2
     assert "dir:" in capsys.readouterr().err
+
+
+def raw_exchange(server, payload):
+    with socket.create_connection(server.server_address, timeout=2) as connection:
+        connection.sendall(payload)
+        reply = HTTPResponse(connection)
+        reply.begin()
+        return reply.status, dict(reply.getheaders()), reply.read()
+
+
+@pytest.mark.parametrize(("request_line", "status", "method"), [
+    pytest.param(b"GARBAGE\r\n\r\n", 400, "-", id="garbage-request-line"),
+    pytest.param(b"POST / HTTP/9.9\r\n\r\n", 505, "-", id="unsupported-version"),
+    pytest.param(b"POST / HTTP/1.1\r\nX: " + b"a" * 70000 + b"\r\n\r\n", 431, "POST", id="oversized-header"),
+])
+def test_unparseable_request_keeps_json_contract_and_log(recorder, tmp_path, capsys, request_line, status, method):
+    code, headers, body = raw_exchange(recorder(), request_line)
+    assert code == status
+    assert headers["Content-Type"] == "application/json"
+    assert json.loads(body) == {"reason": "bad_request"}
+    assert b"GARBAGE" not in body and b"<" not in body
+    assert list(tmp_path.iterdir()) == []
+    # The method is logged once the request line parsed; everything else is "-".
+    assert capsys.readouterr().err == f"{method} {status} - - - -\n"
+
+
+def test_server_header_discloses_no_version(recorder):
+    _, headers, _ = raw_exchange(recorder(), request_bytes() + b"{}")
+    assert headers["Server"] == "hookreplay"
+    assert "Python" not in headers["Server"]
+
+
+def test_reset_during_headers_leaves_no_traceback(recorder, tmp_path, monkeypatch, capsys):
+    import struct
+
+    server = recorder()
+    finished = threading.Event()
+    original = server.finish_request
+
+    def finish(*args):
+        try:
+            return original(*args)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(server, "finish_request", finish)
+    with socket.create_connection(server.server_address, timeout=2) as connection:
+        connection.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n")
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    assert finished.wait(2)
+    assert list(tmp_path.iterdir()) == []
+    assert capsys.readouterr().err == ""
+
+
+def test_log_line_is_written_atomically(recorder, monkeypatch):
+    import sys
+
+    writes = []
+
+    class Stream:
+        def write(self, text):
+            writes.append(text)
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stderr", Stream())
+    assert exchange(recorder(), request_bytes(), b"{}")[0] == 202
+    assert writes == ["POST 202 test-delivery-001 ping 2 null\n"]
+
+
+def test_storage_error_response_names_only_the_exception_class(recorder, tmp_path, monkeypatch):
+    def fail(*args, **kwargs):
+        raise OSError(errno.EPERM, "sensitive path /private/tmp")
+
+    monkeypatch.setattr(store.os, "link", fail)
+    status, result = exchange(recorder(), request_bytes(), b"{}")
+    assert (status, result) == (500, {"reason": "storage_error", "error_class": "PermissionError"})
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_storage_collision_response_has_no_error_class(recorder, tmp_path, monkeypatch):
+    from conftest import NOW
+
+    monkeypatch.setattr(store, "clock", lambda: NOW)
+    monkeypatch.setattr(store, "new_id", lambda: "c" * 12)
+    assert exchange(recorder(), request_bytes(), b"{}")[0] == 202
+    status, result = exchange(recorder(), request_bytes(), b"{}")
+    assert (status, result) == (500, {"reason": "storage_collision"})
+    assert len(list(tmp_path.iterdir())) == 1
