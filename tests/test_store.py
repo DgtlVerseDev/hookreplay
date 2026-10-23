@@ -240,3 +240,29 @@ def test_storage_errors_are_sanitized_and_cleaned(tmp_path, monkeypatch, operati
     assert error.value.reason == "storage_error"
     assert "/private" not in str(error.value)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_unlink_failure_after_link_keeps_the_published_record(tmp_path, monkeypatch):
+    def refuse(self, missing_ok=False):
+        raise OSError(errno.EPERM, "sensitive path /private/tmp")
+
+    monkeypatch.setattr(store.Path, "unlink", refuse)
+    path = store.write_record(tmp_path, b"payload", HEADERS, clock=lambda: NOW, new_id=lambda: "b" * 12)
+    assert path.name == "20260102T030405123456Z-bbbbbbbbbbbb.json"
+    assert store.read_record(path)[1] == b"payload"
+    # The leftover temporary file is ignored by readers and left for a human.
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == [f".{'b' * 12}.tmp", path.name]
+
+
+def test_unlink_failure_does_not_mask_the_pending_reason(tmp_path, monkeypatch):
+    first = store.write_record(tmp_path, b"first", HEADERS, clock=lambda: NOW, new_id=lambda: "a" * 12)
+
+    def refuse(self, missing_ok=False):
+        raise OSError(errno.EPERM, "sensitive path /private/tmp")
+
+    monkeypatch.setattr(store.Path, "unlink", refuse)
+    with pytest.raises(store.StorageError) as error:
+        store.write_record(tmp_path, b"second", HEADERS, clock=lambda: NOW, new_id=lambda: "a" * 12)
+    assert error.value.reason == "storage_collision"
+    assert "/private" not in str(error.value)
+    assert store.read_record(first)[1] == b"first"
